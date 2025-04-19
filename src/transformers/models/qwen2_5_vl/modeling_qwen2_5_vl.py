@@ -43,6 +43,7 @@ from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import PreTrainedModel
 from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
+from verl.utils.device import is_cuda_available, is_npu_available
 
 
 if is_flash_attn_available():
@@ -155,6 +156,13 @@ def apply_rotary_pos_emb_flashatt(
     k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
     return q_embed, k_embed
 
+def apply_rotary_pos_emb_flashatt_npu(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_embed = apply_rotary_emb(q.float(), cos.unsqueeze(0).unsqueeze(2).float(), sin.unsqueeze(0).unsqueeze(2).float()).type_as(q)
+    k_embed = apply_rotary_emb(k.float(), cos.unsqueeze(0).unsqueeze(2).float(), sin.unsqueeze(0).unsqueeze(2).float()).type_as(k)
+    return q_embed, k_embed
+
 
 class Qwen2_5_VLVisionFlashAttention2(nn.Module):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
@@ -184,14 +192,22 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
             sin = emb.sin()
         else:
             cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+        if is_cuda_available:
+            q, k = apply_rotary_pos_emb_flashatt(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
+        elif is_npu_available:
+            q, k = apply_rotary_pos_emb_flashatt_npu(q.unsqueeze(0), k.unsqueeze(0), cos, sin)
         q = q.squeeze(0)
         k = k.squeeze(0)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-            seq_length, -1
-        )
+        if is_cuda_available:
+            attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+                seq_length, -1
+            )
+        elif is_npu_available:
+            attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens).reshape(
+                seq_length, -1
+            )
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -303,9 +319,14 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
         v = v.transpose(0, 1)
-        attn_output = F.scaled_dot_product_attention(
-            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
-        )
+        if is_cuda_available:
+            attn_output = F.scaled_dot_product_attention(
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
+            )
+        elif is_npu_available:
+            attn_output = F.scaled_dot_product_attention(
+                q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask.unsqueeze(0), dropout_p=0.0
+            )
         attn_output = attn_output.squeeze(0).transpose(0, 1)
         attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
